@@ -1,6 +1,7 @@
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from pydantic import BaseModel, Field
 import hashlib
+import traceback
 
 from app.services.pdf_services import extract_text_from_pdf
 from app.services.document_store import (
@@ -10,11 +11,18 @@ from app.services.document_store import (
     find_document_by_hash,
     delete_document,
 )
+from app.services.conversation_service import(
+    create_conversation,
+    save_message,
+    link_document_to_conversation,
+)
 from app.services.chunking_service import chunk_pages
 from app.services.embedding_service import generate_embeddings
 from app.services.vector_store import add_chunks, search_chunks,delete_chunks
 from app.services.answer_service import generate_answer
 from app.services.docx_services import extract_text_from_docx
+from app.services.document_deletion_service import delete_document_completely
+from app.services.document_analysis_service import generate_document_overview
 
 router = APIRouter(prefix="/papers", tags=["Papers"])
 
@@ -25,33 +33,33 @@ class SearchRequest(BaseModel):
         document_id: str| None = None
         top_k:int = Field(default=5,ge=1,le=10)
 
+
 @router.post("/upload")
 async def upload_pdf(file: UploadFile = File(...)):
     filename = (file.filename or "").strip().lower()
-    
+
     if not filename.endswith((".pdf", ".docx")):
         raise HTTPException(
             status_code=400,
             detail="Please upload a PDF or DOCX file.",
-    )
+        )
 
     content = await file.read(MAX_FILE_SIZE + 1)
-    
 
     if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(413, "PDF exceeds the 20 MB limit.")
-    
+        raise HTTPException(413, "File exceeds the 20 MB limit.")
+
     file_hash = hashlib.sha256(content).hexdigest()
-        
+
     existing_document = find_document_by_hash(file_hash)
-        
+
     if existing_document:
-            return{
-                **existing_document,
-                "total_chunks":None,
-                "duplicate":True,
-                "message":"this pdf has already been uploaded,",
-            }
+        return {
+            **existing_document,
+            "total_chunks": None,
+            "duplicate": True,
+            "message": "This document has already been uploaded.",
+        }
 
     try:
         if filename.endswith(".pdf"):
@@ -62,14 +70,13 @@ async def upload_pdf(file: UploadFile = File(...)):
         raise HTTPException(
             status_code=400,
             detail="Invalid or unreadable PDF/DOCX file.",
-    )
+        )
 
     if not any(page["text"].strip() for page in pages):
         raise HTTPException(
             422,
             "No selectable text found. OCR support is needed for scanned PDFs.",
         )
-        
 
     # 1. Split extracted text into chunks
     chunks = chunk_pages(pages)
@@ -77,7 +84,7 @@ async def upload_pdf(file: UploadFile = File(...)):
     if not chunks:
         raise HTTPException(
             422,
-            "No readable text found in the PDF."
+            "No readable text found in the document.",
         )
 
     # 2. Generate embeddings
@@ -86,10 +93,11 @@ async def upload_pdf(file: UploadFile = File(...)):
     )
 
     # 3. Save document details
-    document = save_document(file.filename, 
-                             pages,
-                             file_hash=file_hash,
-                            )
+    document = save_document(
+        file.filename,
+        pages,
+        file_hash=file_hash,
+    )
 
     # 4. Store chunks and embeddings in ChromaDB
     add_chunks(
@@ -98,8 +106,44 @@ async def upload_pdf(file: UploadFile = File(...)):
         embeddings,
     )
 
-    # 5. Return document details
+    # 5. Create a conversation for this document
+    conversation = create_conversation(title=file.filename)
+    conversation_id = conversation["conversation_id"]
+
+    # 6. Link document to conversation
+    link_document_to_conversation(
+        conversation_id,
+        document["document_id"],
+    )
+
+    # 7. Generate automatic document overview
+    try:
+        assistant_message = generate_document_overview(
+            filename=file.filename,
+            pages=pages,
+        )
+    except Exception as exc:
+        print("DOCUMENT ANALYSIS FAILED:", exc)
+        traceback.print_exc()
+
+        assistant_message = (
+            f"I've successfully processed {file.filename}, "
+            "but couldn't generate its overview. "
+            "You can still ask me questions about the document."
+        )
+
+    # 8. Save overview as the first assistant message
+    save_message(
+        conversation_id=conversation_id,
+        role="assistant",
+        content=assistant_message,
+    )
+
+    # 9. Return document and conversation details
     document["total_chunks"] = len(chunks)
+    document["assistant_message"] = assistant_message
+    document["conversation_id"] = conversation_id
+    document["duplicate"] = False
 
     return document
 
@@ -156,53 +200,28 @@ def get_document_by_id(document_id: str):
 @router.delete("/{document_id}")
 def delete_paper(document_id: str):
 
-    # 1. Check whether document exists in SQLite
-    document = get_document(document_id)
-
-    if document is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Document not found."
-        )
-
-    # 2. Delete vectors from ChromaDB
     try:
-        deleted_chunks = delete_chunks(document_id)
+        result = delete_document_completely(document_id)
 
-    except Exception as exc:
-        print(f"ChromaDB deletion error: {exc}")
-
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to delete document vectors."
-        )
-
-    # 3. Delete document from SQLite
-    try:
-        deleted = delete_document(document_id)
-
-        if not deleted:
+        if not result["success"]:
             raise HTTPException(
-                status_code=500,
-                detail="Failed to delete document metadata."
+                status_code=404,
+                detail=result["message"],
             )
+
+        return result
 
     except HTTPException:
         raise
 
     except Exception as exc:
-        print(f"SQLite deletion error: {exc}")
+        print(f"Document deletion error: {exc}")
 
         raise HTTPException(
             status_code=500,
-            detail="Failed to delete document metadata."
+            detail="Document deletion failed.",
         )
 
-    return {
-        "message": "Document deleted successfully.",
-        "document_id": document_id,
-        "deleted_chunks": deleted_chunks,
-    }
 
 class AskRequest(BaseModel):
     query: str = Field(min_length=1, max_length=2000)

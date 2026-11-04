@@ -11,11 +11,14 @@ DB_PATH = Path(__file__).resolve().parents[2] / "documents.db"
 def get_connection():
     connection = sqlite3.connect(DB_PATH)
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
     return connection
 
 
 def initialize_database():
     with get_connection() as connection:
+
+        # Documents table
         connection.execute("""
             CREATE TABLE IF NOT EXISTS documents (
                 document_id TEXT PRIMARY KEY,
@@ -25,6 +28,69 @@ def initialize_database():
                 total_characters INTEGER NOT NULL,
                 pages TEXT NOT NULL
             )
+        """)
+
+        # Deletion jobs table
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS deletion_jobs (
+                job_id TEXT PRIMARY KEY,
+                document_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        
+                # Conversations table
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS conversations (
+                conversation_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT 'New Chat',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+
+        # Messages table
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                message_id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                sources TEXT,
+                created_at TEXT NOT NULL,
+
+                FOREIGN KEY (conversation_id)
+                REFERENCES conversations(conversation_id)
+                ON DELETE CASCADE
+            )
+        """)
+
+        # Link conversations with uploaded documents
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS conversation_documents (
+                conversation_id TEXT NOT NULL,
+                document_id TEXT NOT NULL,
+
+                PRIMARY KEY (conversation_id, document_id),
+
+                FOREIGN KEY (conversation_id)
+                REFERENCES conversations(conversation_id)
+                ON DELETE CASCADE,
+
+                FOREIGN KEY (document_id)
+                REFERENCES documents(document_id)
+                ON DELETE CASCADE
+            )
+        """)
+
+        # Index for faster conversation history retrieval
+        connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_messages_conversation
+            ON messages(conversation_id, created_at)
         """)
 
 
@@ -134,3 +200,64 @@ def delete_document(document_id: str) -> bool:
         )
 
         return cursor.rowcount > 0
+
+from datetime import datetime, timezone
+
+
+def create_deletion_job(document_id: str) -> str:
+    job_id = str(uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+
+    with get_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO deletion_jobs (
+                job_id,
+                document_id,
+                status,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, 'PENDING', ?, ?)
+            """,
+            (job_id, document_id, now, now),
+        )
+
+    return job_id
+
+
+def get_pending_deletion_jobs() -> list[dict]:
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM deletion_jobs
+            WHERE status IN ('PENDING', 'FAILED')
+            ORDER BY created_at ASC
+            """
+        ).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+def update_deletion_job(
+    job_id: str,
+    status: str,
+    error: str | None = None,
+) -> None:
+
+    now = datetime.now(timezone.utc).isoformat()
+
+    with get_connection() as connection:
+        connection.execute(
+            """
+            UPDATE deletion_jobs
+            SET
+                status = ?,
+                attempts = attempts + 1,
+                last_error = ?,
+                updated_at = ?
+            WHERE job_id = ?
+            """,
+            (status, error, now, job_id),
+        )
